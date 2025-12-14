@@ -84,7 +84,7 @@ def build_pdf_report(summary: dict, issues: list[dict], max_examples: int = 4) -
 
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
+    _, height = A4
 
     left = 18 * mm
     top = height - 18 * mm
@@ -161,6 +161,12 @@ st.set_page_config(page_title="AdChainAudit", layout="wide")
 st.title("🛡️ AdChainAudit")
 st.caption(
     "Audit the ad supply chain starting with ads.txt. Upload a file or paste contents to generate a buyer focused red flag summary."
+)
+
+# ✅ Always-visible open-source note (top of page)
+st.info(
+    "🔓 Open source (MIT License). GitHub for technical contributors: "
+    "https://github.com/maazkhan86/AdChainAudit"
 )
 
 with st.sidebar:
@@ -296,19 +302,5 @@ with colD:
 
 with st.expander("Preview: TXT report", expanded=False):
     st.code(report_txt)
-
-# ✅ Open-source + contribution block (clean, not too big)
-st.markdown("---")
-with st.expander("Open source, MIT license, and contributions", expanded=False):
-    st.markdown(
-        """
-AdChainAudit is **open source** under the **MIT License**.
-
-- 🌟 GitHub repo (for technical users who want to contribute or extend it):  
-  https://github.com/maazkhan86/AdChainAudit
-
-- 🤝 Want to help? New rules, better scoring, sellers.json checks, and supply chain mapping are welcome.
-"""
-    )
 
 st.caption("Tip: Exports are useful evidence snapshots because ads.txt can change over time.")
