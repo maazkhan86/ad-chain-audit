@@ -1,0 +1,35 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# ---- Virtual env ----
+.venv/
+venv/
+ENV/
+
+# ---- Testing / coverage ----
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- Linters / type checkers ----
+.mypy_cache/
+.ruff_cache/
+
+# ---- Streamlit ----
+.streamlit/secrets.toml
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Outputs / reports ----
+reports/
+*.json
