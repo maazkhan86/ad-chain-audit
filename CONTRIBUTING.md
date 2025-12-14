@@ -14,7 +14,7 @@ This project aims to be:
 
 ### 1) Fork + clone
 ```bash
-git clone https://github.com/<your-username>/AdChainAudit.git
+git clone https://github.com/maazkhan86/AdChainAudit.git
 cd AdChainAudit
 ```
 
