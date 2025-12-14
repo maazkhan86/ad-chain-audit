@@ -1,1 +1,2 @@
 streamlit>=1.36
+reportlab>=4.0
