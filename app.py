@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
 
 import streamlit as st
 
@@ -10,7 +10,6 @@ from analyzer import analyze_ads_txt, report_to_csv_bytes, report_to_json_bytes,
 
 APP_TITLE = "AdChainAudit"
 
-# --- Sample snapshot ---
 SAMPLE_PATH = Path("samples/thestar_ads_20251214.txt")
 SAMPLE_LABEL = "thestar.com.my/ads.txt (snapshot: 14 Dec 2025)"
 SAMPLE_SOURCE_NOTE = (
@@ -18,7 +17,6 @@ SAMPLE_SOURCE_NOTE = (
     "ads.txt changes over time; treat this as a demo input."
 )
 
-# --- Links ---
 GITHUB_REPO_URL = "https://github.com/maazkhan86/AdChainAudit"
 
 
@@ -47,23 +45,120 @@ def get_source_label() -> str:
     return st.session_state.get("source_label", "Uploaded/Pasted ads.txt")
 
 
-def main() -> None:
-    st.set_page_config(
-        page_title=APP_TITLE,
-        page_icon="🛡️",
-        layout="wide",
-        initial_sidebar_state="collapsed",
-    )
+# -------------------------------
+# Theme logic (marketing-friendly)
+# -------------------------------
 
-    # Header
+SEV_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+SEV_BADGE = {"CRITICAL": "🟥", "HIGH": "🟧", "MEDIUM": "🟨", "LOW": "🟦"}
+
+RULE_THEME = {
+    "MALFORMED_LINE": "Format & spec compliance",
+    "INVALID_RELATIONSHIP": "Format & spec compliance",
+    "RELATIONSHIP_AMBIGUITY": "Selling relationship clarity",
+    "MISSING_CAID": "Verification signals (optional)",
+}
+
+THEME_INFO = {
+    "Format & spec compliance": {
+        "why": "If the ads.txt is messy or non-standard, it becomes harder to trust automated checks and validate who’s authorized to sell inventory.",
+        "questions": [
+            "Can the publisher clean the file to be spec-compliant (3–4 fields, correct relationship values)?",
+            "Are inline comments or formatting causing interpretation issues?",
+        ],
+    },
+    "Selling relationship clarity": {
+        "why": "If the same seller appears as both DIRECT and RESELLER, it can be unclear which route is preferred — and whether intermediaries are being added unnecessarily.",
+        "questions": [
+            "Which route is preferred for our buys for this publisher?",
+            "Can we prioritize DIRECT where available and justify reseller paths?",
+        ],
+    },
+    "Verification signals (optional)": {
+        "why": "Verification fields (like CAID) can help at scale, but many publishers omit them. This is usually an ‘extra signal’, not a hard red flag.",
+        "questions": [
+            "Optional: can the publisher/seller include CAID where applicable?",
+        ],
+    },
+}
+
+
+def theme_for_rule(rule_id: str) -> str:
+    return RULE_THEME.get(rule_id, "Other")
+
+
+def max_severity(findings: List[dict]) -> str:
+    if not findings:
+        return "LOW"
+    best = "LOW"
+    for f in findings:
+        sev = f.get("severity", "LOW")
+        if SEV_ORDER.get(sev, 1) > SEV_ORDER.get(best, 1):
+            best = sev
+    return best
+
+
+def group_findings_by_theme(findings: List[dict]) -> Dict[str, List[dict]]:
+    buckets: Dict[str, List[dict]] = {}
+    for f in findings:
+        rid = f.get("rule_id", "OTHER")
+        theme = theme_for_rule(rid)
+        buckets.setdefault(theme, []).append(f)
+    # Keep a consistent, friendly order
+    ordered = {}
+    for k in ["Format & spec compliance", "Selling relationship clarity", "Verification signals (optional)", "Other"]:
+        if k in buckets:
+            ordered[k] = buckets[k]
+    # any remaining themes
+    for k, v in buckets.items():
+        if k not in ordered:
+            ordered[k] = v
+    return ordered
+
+
+def top_rule_counts_in_theme(findings: List[dict], n: int = 3) -> List[Tuple[str, int]]:
+    counts: Dict[str, int] = {}
+    for f in findings:
+        rid = f.get("rule_id", "OTHER")
+        counts[rid] = counts.get(rid, 0) + 1
+    items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    return items[:n]
+
+
+def compact_pill_notice() -> None:
+    pill_html = f"""
+    <div style="
+        display:flex; gap:10px; align-items:flex-start;
+        background:#EAF4FF; border:1px solid #CFE6FF;
+        padding:10px 12px; border-radius:12px;
+        line-height:1.25; font-size:14px; color:#0B2540;
+    ">
+      <div style="font-size:18px; margin-top:1px;">ℹ️</div>
+      <div>
+        <div><b>Open-source (MIT)</b> ✅</div>
+        <div style="margin-top:2px;">
+          Marketers can use the app. Technical folks can contribute via
+          <a href="{GITHUB_REPO_URL}" target="_blank" style="color:#0B5FFF; text-decoration:none;">
+            GitHub
+          </a>.
+        </div>
+      </div>
+    </div>
+    """
+    st.markdown(pill_html, unsafe_allow_html=True)
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, page_icon="🛡️", layout="wide")
+
     st.markdown(f"# 🛡️ {APP_TITLE}")
     st.caption(
         "Audit the ad supply chain starting with ads.txt. "
         "Upload or paste an ads.txt file to generate a buyer-focused red-flag summary."
     )
 
-    # Compact action row
-    c1, c2, c3 = st.columns([1.25, 1.25, 3.5])
+    # Top row
+    c1, c2, c3 = st.columns([1.15, 1.25, 3.6])
 
     with c1:
         if st.button("⚡ Try sample ads.txt", use_container_width=True):
@@ -73,36 +168,9 @@ def main() -> None:
     with c2:
         st.link_button("👩‍💻 GitHub (technical)", GITHUB_REPO_URL, use_container_width=True)
 
-    # Tight pill-style banner (less height)
     with c3:
-        pill_html = f"""
-        <div style="
-            display:flex;
-            gap:10px;
-            align-items:flex-start;
-            background:#EAF4FF;
-            border:1px solid #CFE6FF;
-            padding:10px 12px;
-            border-radius:12px;
-            line-height:1.25;
-            font-size:14px;
-            color:#0B2540;
-        ">
-          <div style="font-size:18px; margin-top:1px;">ℹ️</div>
-          <div>
-            <div><b>Open-source (MIT)</b> ✅</div>
-            <div style="margin-top:2px;">
-              Marketers can use the app. Technical folks can contribute via
-              <a href="{GITHUB_REPO_URL}" target="_blank" style="color:#0B5FFF; text-decoration:none;">
-                GitHub
-              </a>.
-            </div>
-          </div>
-        </div>
-        """
-        st.markdown(pill_html, unsafe_allow_html=True)
+        compact_pill_notice()
 
-    # Compact how-to
     with st.expander("📌 How to get a site’s ads.txt (quick)", expanded=False):
         st.markdown(
             """
@@ -112,7 +180,26 @@ def main() -> None:
 """
         )
 
-    # Input tabs
+    with st.expander("🧮 How the risk score works (simple)", expanded=False):
+        st.markdown(
+            """
+- Score starts at **100** (cleanest).
+- We apply **penalties by rule severity** (HIGH issues reduce more than LOW).
+- Repeated issues have **diminishing impact** (the 100th repeat matters less than the 2nd).
+- Final score stays between **0 and 100**.
+
+**Risk levels**
+- **LOW**: 80–100  
+- **MEDIUM**: 55–79  
+- **HIGH**: 0–54  
+
+This is a **sanity-check score** to prioritize questions. It doesn’t prove fraud by itself.
+"""
+        )
+
+    include_optional = st.checkbox("Include optional signals (e.g., missing CAID)", value=False)
+
+    # Input
     tab_upload, tab_paste = st.tabs(["📤 Upload ads.txt", "📋 Paste ads.txt"])
 
     with tab_upload:
@@ -143,42 +230,98 @@ def main() -> None:
             st.stop()
 
         with st.spinner("Analyzing…"):
-            report = analyze_ads_txt(text=text, source_label=get_source_label())
+            report = analyze_ads_txt(
+                text=text,
+                source_label=get_source_label(),
+                include_optional_checks=include_optional,
+            )
 
-        # Summary row
+        # Metrics
         top = st.columns([1.1, 1.1, 1.1, 1.7])
         top[0].metric("Risk score", report["summary"]["risk_score"])
         top[1].metric("Risk level", report["summary"]["risk_level"])
         top[2].metric("Findings", report["summary"]["finding_count"])
         top[3].metric("Entries", report["summary"]["entry_count"])
 
-        # Findings
-        st.subheader("Buyer-relevant red flags")
         findings = report.get("findings", [])
         if not findings:
             st.success("No red flags detected by the current rule set.")
         else:
-            for f in findings[:50]:
-                sev = f.get("severity", "LOW")
-                title = f.get("title", "Finding")
-                why = f.get("why_buyer_cares", "")
-                evidence = f.get("evidence", {})
-                line_no = evidence.get("line_no")
-                line = evidence.get("line", "")
+            # -------------------------------
+            # Theme-based summary (NEW)
+            # -------------------------------
+            st.subheader("Themes summary (what to focus on)")
+            buckets = group_findings_by_theme(findings)
 
-                badge = {"CRITICAL": "🟥", "HIGH": "🟧", "MEDIUM": "🟨", "LOW": "🟦"}.get(sev, "🟦")
+            # Optional: a small at-a-glance row
+            theme_cols = st.columns(min(4, max(1, len(buckets))))
+            for i, (theme, fs) in enumerate(list(buckets.items())[:4]):
+                sev = max_severity(fs)
+                badge = SEV_BADGE.get(sev, "🟦")
+                theme_cols[i].metric(f"{badge} {theme}", len(fs))
 
-                with st.expander(f"{badge} [{sev}] {title}", expanded=False):
-                    if why:
-                        st.write(why)
-                    if line_no is not None:
-                        st.code(f"Line {line_no}: {line}".strip())
-                    rec = f.get("recommendation", "")
-                    if rec:
-                        st.markdown(f"**What to do:** {rec}")
+            st.caption("Tip: Start with the highest-severity theme and the most repeated issue inside it.")
 
-            if len(findings) > 50:
-                st.caption(f"Showing first 50 findings out of {len(findings)}.")
+            # One expander per theme (clean + not repetitive)
+            for theme, fs in buckets.items():
+                sev = max_severity(fs)
+                badge = SEV_BADGE.get(sev, "🟦")
+                info = THEME_INFO.get(theme, {})
+                why = info.get("why", "Grouped issues for easier review.")
+                questions = info.get("questions", [])
+
+                top_rules = top_rule_counts_in_theme(fs, n=3)
+                top_rules_str = ", ".join([f"{rid} ({cnt})" for rid, cnt in top_rules]) if top_rules else "—"
+
+                with st.expander(f"{badge} {theme} — {len(fs)} signals (max severity: {sev})", expanded=False):
+                    st.markdown(f"**Why it matters:** {why}")
+                    st.markdown(f"**Most repeated signals:** {top_rules_str}")
+
+                    if questions:
+                        st.markdown("**Questions to ask (practical):**")
+                        for q in questions:
+                            st.markdown(f"- {q}")
+
+                    # Show a few evidence examples only (avoid walls of text)
+                    st.markdown("**Example evidence (first 5):**")
+                    shown = 0
+                    for f in fs:
+                        ev = f.get("evidence", {})
+                        ln = ev.get("line_no")
+                        line = ev.get("line", "")
+                        title = f.get("title", "Finding")
+                        if ln is not None and line:
+                            st.caption(f"- {title}")
+                            st.code(f"Line {ln}: {line}".strip())
+                            shown += 1
+                        if shown >= 5:
+                            break
+                    if len(fs) > 5:
+                        st.caption(f"Showing 5 examples out of {len(fs)}. Use CSV export for the full list.")
+
+            # -------------------------------
+            # Optional: keep raw list hidden
+            # -------------------------------
+            with st.expander("📋 See raw finding list (advanced)", expanded=False):
+                st.caption("This is the ungrouped list. It can be repetitive for large files.")
+                for f in findings[:50]:
+                    sev = f.get("severity", "LOW")
+                    title = f.get("title", "Finding")
+                    badge = SEV_BADGE.get(sev, "🟦")
+                    with st.expander(f"{badge} [{sev}] {title}", expanded=False):
+                        why = f.get("why_buyer_cares", "")
+                        if why:
+                            st.write(why)
+                        ev = f.get("evidence", {})
+                        ln = ev.get("line_no")
+                        line = ev.get("line", "")
+                        if ln is not None:
+                            st.code(f"Line {ln}: {line}".strip())
+                        rec = f.get("recommendation", "")
+                        if rec:
+                            st.markdown(f"**What to do:** {rec}")
+                if len(findings) > 50:
+                    st.caption(f"Showing first 50 findings out of {len(findings)}.")
 
         # Exports
         st.subheader("Exports")
