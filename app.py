@@ -1,574 +1,414 @@
 # app.py
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
-import requests
 
-from analyzer import analyze_ads_txt, report_to_csv_bytes, report_to_json_bytes, report_to_txt_bytes
+# Your existing modules (keep these file names the same in your repo)
+from analyzer import analyze_ads_txt
 from phase2_sellers_json import run_sellers_json_verification
 
+# ---- Config ----
 APP_TITLE = "AdChainAudit"
+REPO_URL = "https://github.com/maazkhan86/AdChainAudit"
+WEB_APP_URL = "https://adchainaudit.streamlit.app/"
 
-SAMPLE_PATH = Path("samples/thestar_ads_20251214.txt")
-SAMPLE_LABEL = "thestar.com.my/ads.txt (snapshot: 14 Dec 2025)"
-SAMPLE_SOURCE_NOTE = (
-    "Sample snapshot source: thestar.com.my/ads.txt (captured 14 Dec 2025). "
-    "ads.txt changes over time; treat this as a demo input."
-)
+# If you keep a sample file in your repo, put it under samples/sample_ads.txt
+# Example: samples/thestar_ads.txt
+SAMPLE_PATH_CANDIDATES = [
+    "samples/thestar_ads.txt",
+    "samples/sample_ads.txt",
+    "ads.txt",  # fallback if you keep it in root
+]
 
-GITHUB_REPO_URL = "https://github.com/maazkhan86/AdChainAudit"
+# Fetch behavior (hardcoded ON)
+TRY_HTTP_IF_HTTPS_FAILS = True
+CAPTURE_FETCH_DEBUG_ALWAYS = True
+INCLUDE_OPTIONAL_SIGNALS_ALWAYS = True
+VERIFY_SELLER_ACCOUNTS_ALWAYS = True
 
-
-@st.cache_data(show_spinner=False)
-def load_sample_text() -> str:
-    if SAMPLE_PATH.exists():
-        return SAMPLE_PATH.read_text(encoding="utf-8", errors="replace")
-    return (
-        "# Sample file missing.\n"
-        "# Please add: samples/thestar_ads_20251214.txt\n"
-        "# Paste your thestar.com.my/ads.txt snapshot (14 Dec 2025) into that file.\n"
-    )
-
-
-def set_ads_text(text: str, label: Optional[str] = None) -> None:
-    st.session_state["ads_text"] = text
-    if label is not None:
-        st.session_state["source_label"] = label
+# ---- Optional dependency: requests ----
+# Add `requests>=2.31` in requirements.txt if not already.
+import requests
 
 
-def get_ads_text() -> str:
-    return st.session_state.get("ads_text", "")
+@dataclass
+class FetchAttempt:
+    url: str
+    ok: bool
+    status: Optional[int]
+    content_type: Optional[str]
+    size_bytes: Optional[int]
+    error: Optional[str]
 
 
-def get_source_label() -> str:
-    return st.session_state.get("source_label", "Uploaded/Pasted ads.txt")
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-# -------------------------------
-# Seller verification interpretation
-# -------------------------------
-def explain_match_rate(avg_match_rate: float, unreachable: int) -> Tuple[str, str]:
-    if avg_match_rate >= 0.85:
-        interp = "✅ Strong verification coverage. Most seller IDs listed in ads.txt are confirmed by sellers.json."
-        action = "Next: Focus on the remaining mismatches and confirm the preferred DIRECT path for your buys."
-    elif avg_match_rate >= 0.60:
-        interp = "🟨 Mixed verification. A meaningful share of seller IDs could not be confirmed via sellers.json."
-        action = "Next: Ask the publisher/SSP to confirm the correct seller account IDs and the preferred buying path (DIRECT where possible)."
-    elif avg_match_rate >= 0.30:
-        interp = "🟧 Weak verification. Many seller IDs in ads.txt were not found in sellers.json."
-        action = "Next: Treat this as a transparency risk. Request clarification on seller IDs and avoid unnecessary reseller-heavy paths."
-    else:
-        interp = "🟥 Very low verification. Most seller IDs could not be validated via sellers.json."
-        action = "Next: Escalate with your publisher/SSP. Ask for confirmation of authorized paths and consider tighter SPO controls."
-
-    if unreachable > 0:
-        action += " Note: some ad systems were unreachable or blocked, which also reduces verification confidence."
-
-    return interp, action
+def normalize_domain(raw: str) -> str:
+    raw = (raw or "").strip()
+    raw = re.sub(r"^https?://", "", raw, flags=re.IGNORECASE)
+    raw = raw.strip().strip("/")
+    raw = raw.replace("www.", "", 1) if raw.lower().startswith("www.") else raw
+    return raw
 
 
-# -------------------------------
-# Fetch ads.txt (with safe fallback + debug)
-# -------------------------------
-def _normalize_site(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = s.replace("http://", "").replace("https://", "")
-    s = s.strip("/")
-    return s
+def build_ads_txt_urls(domain: str) -> List[str]:
+    # Try both apex and www
+    https_urls = [
+        f"https://{domain}/ads.txt",
+        f"https://www.{domain}/ads.txt",
+    ]
+    if not TRY_HTTP_IF_HTTPS_FAILS:
+        return https_urls
+
+    http_urls = [
+        f"http://{domain}/ads.txt",
+        f"http://www.{domain}/ads.txt",
+    ]
+    return https_urls + http_urls
 
 
-def _looks_like_ads_txt(text: str) -> bool:
-    if not text or len(text) < 20:
-        return False
-    # ads.txt almost always has commas separating fields
-    return "," in text
+def looks_like_html(text: str) -> bool:
+    head = (text or "").lstrip()[:200].lower()
+    return head.startswith("<!doctype html") or head.startswith("<html") or "<body" in head
 
 
-def _looks_like_html_block(text: str, content_type: str) -> bool:
-    ct = (content_type or "").lower()
-    head = (text or "")[:600].lower()
-    if "text/html" in ct:
-        return True
-    if "<html" in head or "<!doctype html" in head:
-        return True
-    # common block-page terms (light heuristic)
-    if "access denied" in head or "request blocked" in head or "captcha" in head:
-        return True
-    return False
+def fetch_url(url: str, timeout_s: int = 12) -> Tuple[Optional[str], FetchAttempt]:
+    headers = {
+        "User-Agent": "AdChainAudit/1.0 (+https://github.com/maazkhan86/AdChainAudit)",
+        "Accept": "text/plain, text/*;q=0.9, */*;q=0.1",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
+        ct = r.headers.get("content-type")
+        text = r.text if r.status_code == 200 else None
 
-
-def fetch_ads_txt_for_site(
-    site: str,
-    *,
-    timeout: Tuple[int, int] = (5, 15),
-    allow_http_fallback: bool = False,
-) -> Dict:
-    """
-    Attempts a list of candidate URLs.
-    Returns a dict with:
-      ok, text, chosen_url, chosen_status, chosen_content_type,
-      attempts: [{url,status,content_type,looks_html,looks_ads,bytes,error}]
-    """
-    site = _normalize_site(site)
-    if not site:
-        return {
-            "ok": False,
-            "text": None,
-            "chosen_url": None,
-            "chosen_status": None,
-            "chosen_content_type": None,
-            "attempts": [],
-            "reason": "No domain provided",
-        }
-
-    schemes = ["https"]
-    if allow_http_fallback:
-        schemes.append("http")
-
-    candidates = []
-    for scheme in schemes:
-        candidates.extend(
-            [
-                f"{scheme}://{site}/ads.txt",
-                f"{scheme}://www.{site}/ads.txt",
-            ]
+        attempt = FetchAttempt(
+            url=url,
+            ok=(r.status_code == 200),
+            status=r.status_code,
+            content_type=ct,
+            size_bytes=len(r.content) if r.content is not None else None,
+            error=None if r.status_code == 200 else f"Non-200 status ({r.status_code})",
         )
 
-    headers = {
-        "User-Agent": "AdChainAudit/0.2 (+https://github.com/maazkhan86/AdChainAudit)",
-        "Accept": "text/plain,text/*;q=0.9,*/*;q=0.8",
-    }
+        # Some sites return 200 but serve HTML block pages
+        if text and looks_like_html(text):
+            return None, FetchAttempt(
+                url=url,
+                ok=False,
+                status=r.status_code,
+                content_type=ct,
+                size_bytes=len(r.content) if r.content is not None else None,
+                error="Looks like HTML (possible block page / WAF)",
+            )
 
-    attempts = []
-    for url in candidates:
+        return text, attempt
+
+    except requests.RequestException as e:
+        return None, FetchAttempt(
+            url=url,
+            ok=False,
+            status=None,
+            content_type=None,
+            size_bytes=None,
+            error=str(e),
+        )
+
+
+def fetch_ads_txt_for_domain(domain: str) -> Tuple[Optional[str], Optional[str], List[FetchAttempt]]:
+    attempts: List[FetchAttempt] = []
+    for url in build_ads_txt_urls(domain):
+        text, attempt = fetch_url(url)
+        attempts.append(attempt)
+        if text:
+            return text, url, attempts
+    return None, None, attempts
+
+
+def load_sample_text() -> Optional[str]:
+    for p in SAMPLE_PATH_CANDIDATES:
         try:
-            r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-            status = r.status_code
-            ctype = r.headers.get("Content-Type", "")
-            text = r.text or ""
-            looks_html = _looks_like_html_block(text, ctype)
-            looks_ads = _looks_like_ads_txt(text)
-
-            attempts.append(
-                {
-                    "url": url,
-                    "status": status,
-                    "content_type": ctype,
-                    "looks_html": looks_html,
-                    "looks_ads": looks_ads,
-                    "bytes": len((r.content or b"")),
-                    "error": None,
-                }
-            )
-
-            if status == 200 and (not looks_html) and looks_ads:
-                return {
-                    "ok": True,
-                    "text": text,
-                    "chosen_url": url,
-                    "chosen_status": status,
-                    "chosen_content_type": ctype,
-                    "attempts": attempts,
-                    "reason": None,
-                }
-
-        except Exception as e:
-            attempts.append(
-                {
-                    "url": url,
-                    "status": None,
-                    "content_type": None,
-                    "looks_html": None,
-                    "looks_ads": None,
-                    "bytes": None,
-                    "error": str(e),
-                }
-            )
-
-    # If everything failed
-    # Decide a friendly reason
-    reason = "ads.txt not found or blocked"
-    # If any attempt returned HTML with 200/403, likely blocked
-    for a in attempts:
-        if a["status"] in (200, 403, 401) and a.get("looks_html"):
-            reason = "Request appears blocked (HTML response)"
-            break
-        if a["status"] == 404:
-            reason = "ads.txt not found (404)"
-    return {
-        "ok": False,
-        "text": None,
-        "chosen_url": candidates[0] if candidates else None,
-        "chosen_status": None,
-        "chosen_content_type": None,
-        "attempts": attempts,
-        "reason": reason,
-    }
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except Exception:
+            continue
+    return None
 
 
-# -------------------------------
-# Theme logic (marketing-friendly)
-# -------------------------------
-SEV_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
-SEV_BADGE = {"CRITICAL": "🟥", "HIGH": "🟧", "MEDIUM": "🟨", "LOW": "🟦"}
-
-RULE_THEME = {
-    "MALFORMED_LINE": "Format & spec compliance",
-    "INVALID_RELATIONSHIP": "Format & spec compliance",
-    "RELATIONSHIP_AMBIGUITY": "Selling relationship clarity",
-    "MISSING_CAID": "Verification signals (optional)",
-
-    # Seller verification (sellers.json)
-    "SELLERS_JSON_UNREACHABLE": "Seller verification (sellers.json)",
-    "SELLER_ID_NOT_FOUND_IN_SELLERS_JSON": "Seller verification (sellers.json)",
-    "SELLERS_JSON_INTERMEDIARY_SELLERS_PRESENT": "Seller verification (sellers.json)",
-    "SELLERS_JSON_CONFIDENTIAL_SELLERS_PRESENT": "Seller verification (sellers.json)",
-}
-
-THEME_INFO = {
-    "Format & spec compliance": {
-        "why": "If the ads.txt is messy or non-standard, automated checks become less reliable and authorization becomes harder to validate.",
-        "questions": [
-            "Can the publisher clean the file to be spec-compliant (3–4 fields, correct relationship values)?",
-            "Are inline comments or formatting causing interpretation issues?",
-        ],
-    },
-    "Selling relationship clarity": {
-        "why": "If the same seller appears as both DIRECT and RESELLER, it can be unclear which route is preferred and whether intermediaries are being added unnecessarily.",
-        "questions": [
-            "Which route is preferred for our buys for this publisher?",
-            "Can we prioritize DIRECT where available and justify reseller paths?",
-        ],
-    },
-    "Verification signals (optional)": {
-        "why": "The 4th field (Certification Authority ID) can help at scale, but many publishers omit it. This is usually an extra signal, not a hard red flag.",
-        "questions": [
-            "Optional: can the publisher/seller include Certification Authority ID where applicable?",
-        ],
-    },
-    "Seller verification (sellers.json)": {
-        "why": "sellers.json is published by ad systems (SSPs/exchanges) and describes seller accounts. Matching ads.txt seller IDs against sellers.json improves confidence and reduces ambiguity.",
-        "questions": [
-            "Are seller account IDs current and verifiable in sellers.json?",
-            "If many IDs don’t match, can the publisher confirm the preferred selling path?",
-            "If intermediaries dominate, is there a more direct route for our spend?",
-        ],
-    },
-}
+def init_state() -> None:
+    st.session_state.setdefault("ads_txt_text", "")
+    st.session_state.setdefault("input_source", "None")
+    st.session_state.setdefault("fetched_url", None)
+    st.session_state.setdefault("fetched_at", None)
+    st.session_state.setdefault("fetch_attempts", [])
+    st.session_state.setdefault("last_fetch_domain", "")
+    st.session_state.setdefault("last_fetch_ok", False)
 
 
-def theme_for_rule(rule_id: str) -> str:
-    return RULE_THEME.get(rule_id, "Other")
+def set_ads_input(text: str, source: str, fetched_url: Optional[str] = None) -> None:
+    st.session_state["ads_txt_text"] = text or ""
+    st.session_state["input_source"] = source
+    st.session_state["fetched_url"] = fetched_url
+    st.session_state["fetched_at"] = _now_utc_iso() if source.startswith("Fetched") else None
 
 
-def max_severity(findings: List[dict]) -> str:
-    if not findings:
-        return "LOW"
-    best = "LOW"
-    for f in findings:
-        sev = f.get("severity", "LOW")
-        if SEV_ORDER.get(sev, 1) > SEV_ORDER.get(best, 1):
-            best = sev
-    return best
+def get_effective_text(uploaded_file) -> str:
+    # Prefer uploaded file if present; else use textarea / fetched content
+    if uploaded_file is not None:
+        try:
+            return uploaded_file.getvalue().decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+    return st.session_state.get("ads_txt_text", "") or ""
 
 
-def group_findings_by_theme(findings: List[dict]) -> Dict[str, List[dict]]:
-    buckets: Dict[str, List[dict]] = {}
-    for f in findings:
-        rid = f.get("rule_id", "OTHER")
-        theme = theme_for_rule(rid)
-        buckets.setdefault(theme, []).append(f)
-
-    ordered: Dict[str, List[dict]] = {}
-    for k in [
-        "Seller verification (sellers.json)",
-        "Format & spec compliance",
-        "Selling relationship clarity",
-        "Verification signals (optional)",
-        "Other",
-    ]:
-        if k in buckets:
-            ordered[k] = buckets[k]
-    for k, v in buckets.items():
-        if k not in ordered:
-            ordered[k] = v
-    return ordered
+def safe_get_findings(report: Dict) -> List[Dict]:
+    if not isinstance(report, dict):
+        return []
+    for k in ["findings", "issues", "flags", "results"]:
+        v = report.get(k)
+        if isinstance(v, list):
+            return v
+    return []
 
 
-def top_rule_counts_in_theme(findings: List[dict], n: int = 3) -> List[Tuple[str, int]]:
-    counts: Dict[str, int] = {}
-    for f in findings:
-        rid = f.get("rule_id", "OTHER")
-        counts[rid] = counts.get(rid, 0) + 1
-    items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    return items[:n]
+def render_fetch_success_banner() -> None:
+    if st.session_state.get("input_source", "").startswith("Fetched") and st.session_state.get("last_fetch_ok"):
+        url = st.session_state.get("fetched_url")
+        when = st.session_state.get("fetched_at")
+        st.success(
+            f"Fetched ✅ ads.txt loaded from: {url}  •  {when}\n\nYou can now click **Run audit** (no manual upload/paste needed)."
+        )
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🛡️", layout="wide")
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    init_state()
 
-    st.markdown(f"# 🛡️ {APP_TITLE}")
-    st.caption(
-        "Audit the ad supply chain starting with ads.txt. "
-        "Upload, paste, or fetch a site’s ads.txt to generate a buyer-focused red-flag summary."
-    )
-
-    c1, c2 = st.columns([1.15, 1.25])
+    # Header
+    c1, c2 = st.columns([0.78, 0.22])
     with c1:
-        if st.button("⚡ Try sample ads.txt", use_container_width=True):
-            set_ads_text(load_sample_text(), SAMPLE_LABEL)
-            st.rerun()
+        st.title(APP_TITLE)
+        st.caption("Audit the ad supply chain starting with ads.txt. Upload, paste, or fetch a site’s ads.txt to generate a buyer-focused red-flag summary.")
+
     with c2:
-        st.link_button("👩‍💻 GitHub (technical)", GITHUB_REPO_URL, use_container_width=True)
+        st.markdown("")
+        st.link_button("🧰 GitHub (technical)", REPO_URL, use_container_width=True)
 
-    st.divider()
-
-    # NEW: Fetch ads.txt from website (with fallback + debug)
-    st.subheader("Get ads.txt")
-    fc1, fc2 = st.columns([1.35, 0.65])
-    with fc1:
-        site = st.text_input("Website domain", placeholder="example.com", value="")
-        allow_http = st.checkbox(
-            "Try HTTP if HTTPS fails (optional)",
-            value=False,
-            help="Some sites do not serve ads.txt over HTTPS. This tries http:// as a fallback.",
-        )
-        show_debug = st.checkbox(
-            "Show fetch debug details",
-            value=False,
-            help="Shows the exact URLs attempted and response status codes (useful if a site blocks requests).",
-        )
-        st.caption("We try: /ads.txt and /ads.txt on www. If blocked, you can always paste or upload manually.")
-    with fc2:
-        if st.button("🌐 Fetch ads.txt", use_container_width=True):
-            s = _normalize_site(site)
-            if not s:
-                st.warning("Please enter a website domain first (example: example.com).")
+    # Quick actions row
+    qa1, qa2 = st.columns([0.5, 0.5])
+    with qa1:
+        if st.button("⚡ Try sample ads.txt", use_container_width=True):
+            sample = load_sample_text()
+            if not sample:
+                st.error("Sample file not found in repo. Add one under `samples/` (e.g., `samples/sample_ads.txt`).")
             else:
-                with st.spinner("Fetching ads.txt…"):
-                    result = fetch_ads_txt_for_site(s, allow_http_fallback=allow_http)
+                set_ads_input(
+                    sample,
+                    source="Sample (thestar.com.my/ads.txt captured 14 Dec 2025)",
+                    fetched_url=None,
+                )
+                st.session_state["last_fetch_ok"] = True  # treat as “loaded”
+                st.toast("Sample loaded ✅", icon="✅")
 
-                if result["ok"]:
-                    text = result["text"] or ""
-                    url = result["chosen_url"]
-                    set_ads_text(text, f"Fetched: {url}")
-                    st.success(f"ads.txt fetched successfully from {url}")
-                    if show_debug:
-                        with st.expander("Fetch debug details", expanded=True):
-                            st.json(result["attempts"])
-                    st.rerun()
-                else:
-                    st.error("Could not fetch ads.txt automatically.", icon="⚠️")
-                    st.info(
-                        "No problem, this is common. Some sites block automated requests.\n\n"
-                        "**What to do:**\n"
-                        "1) Open the ads.txt link in your browser\n"
-                        "2) Copy all text\n"
-                        "3) Paste it into the app (or download and upload the file)\n"
-                    )
-                    # Show likely first attempt
-                    attempts = result.get("attempts", [])
-                    first_url = attempts[0]["url"] if attempts else result.get("chosen_url", "")
-                    st.markdown(f"Try this in your browser: `{first_url}`")
-                    st.caption(f"Reason: {result.get('reason')}")
-                    if show_debug:
-                        with st.expander("Fetch debug details", expanded=True):
-                            st.json(attempts)
-
-    with st.expander("📌 Manual option (always works)", expanded=False):
-        st.markdown(
-            """
-If automatic fetching is blocked, you can still audit ads.txt easily:
-
-1. Open: `https://example.com/ads.txt`  
-2. Copy all text  
-3. Paste it in the app (or save as `ads.txt` and upload)
-"""
-        )
+    with qa2:
+        st.link_button("🌐 Open web app", WEB_APP_URL, use_container_width=True)
 
     st.divider()
 
-    include_optional = st.checkbox(
-        "Include optional signals (e.g., missing Certification Authority ID)",
-        value=False,
-    )
+    # Fetch section (clean + compact)
+    with st.expander("Get ads.txt (optional)", expanded=True):
+        left, right = st.columns([0.7, 0.3])
 
-    verify_sellers = st.checkbox(
-        "Verify seller accounts (sellers.json) — slower but adds stronger evidence",
-        value=False,
-        help="This fetches public sellers.json files from SSP/exchange domains listed in ads.txt. Some domains may block or rate-limit requests.",
-    )
+        with left:
+            domain = st.text_input(
+                "Website domain",
+                value=st.session_state.get("last_fetch_domain", ""),
+                placeholder="example.com",
+                label_visibility="visible",
+            )
 
-    max_domains = 25
-    if verify_sellers:
-        max_domains = st.slider(
-            "Limit verification to this many ad-system domains (keeps it fast)",
-            min_value=5,
-            max_value=60,
-            value=25,
-            step=5,
-        )
+        with right:
+            st.markdown(" ")
+            if st.button("🌐 Fetch ads.txt", use_container_width=True):
+                nd = normalize_domain(domain)
+                st.session_state["last_fetch_domain"] = nd
+                st.session_state["last_fetch_ok"] = False
 
+                if not nd:
+                    st.warning("Please enter a domain (e.g., `example.com`).")
+                else:
+                    with st.spinner(f"Fetching ads.txt for {nd} ..."):
+                        text, url, attempts = fetch_ads_txt_for_domain(nd)
+
+                    if CAPTURE_FETCH_DEBUG_ALWAYS:
+                        st.session_state["fetch_attempts"] = attempts
+
+                    if text and url:
+                        set_ads_input(text, source=f"Fetched ({nd})", fetched_url=url)
+                        st.session_state["last_fetch_ok"] = True
+                        st.toast("Fetched ✅", icon="✅")
+                    else:
+                        set_ads_input(st.session_state.get("ads_txt_text", ""), source="(unchanged)")
+                        st.error("Couldn’t fetch ads.txt (possibly blocked). Please use Upload or Paste below.")
+
+                        # Show debug automatically only on failure (still “hardcoded” in code)
+                        if st.session_state.get("fetch_attempts"):
+                            with st.expander("Fetch attempts (debug)", expanded=False):
+                                for a in st.session_state["fetch_attempts"]:
+                                    st.write(
+                                        f"- {a.url} | ok={a.ok} | status={a.status} | ct={a.content_type} | err={a.error}"
+                                    )
+
+    # ✅ Very visible banner when fetched/loaded
+    render_fetch_success_banner()
+
+    st.divider()
+
+    # Hardcoded ON (no checkboxes)
+    st.caption("Defaults: optional signals ✅ • sellers.json verification ✅ • auto HTTPS→HTTP fallback ✅")
+
+    # Input tabs
     tab_upload, tab_paste = st.tabs(["📤 Upload ads.txt", "📋 Paste ads.txt"])
 
+    uploaded = None
     with tab_upload:
-        uploaded = st.file_uploader("Upload an ads.txt file", type=["txt"])
+        uploaded = st.file_uploader("Upload an ads.txt file", type=["txt"], label_visibility="visible")
         if uploaded is not None:
-            uploaded_text = uploaded.getvalue().decode("utf-8", errors="replace")
-            set_ads_text(uploaded_text, getattr(uploaded, "name", "Uploaded ads.txt"))
+            set_ads_input("", source="Uploaded file", fetched_url=None)
+            st.session_state["last_fetch_ok"] = True
+            st.toast("File selected ✅", icon="✅")
 
     with tab_paste:
-        ads_text = st.text_area(
-            "Paste ads.txt contents here",
-            value=get_ads_text(),
+        st.session_state["ads_txt_text"] = st.text_area(
+            "Paste ads.txt contents",
+            value=st.session_state.get("ads_txt_text", ""),
             height=220,
-            placeholder="Paste the full contents of ads.txt here…",
+            placeholder="Paste the full ads.txt text here…",
         )
-        set_ads_text(ads_text, get_source_label())
-
-    if get_source_label() == SAMPLE_LABEL:
-        st.error(f"🚨 SAMPLE LOADED: {SAMPLE_SOURCE_NOTE}", icon="⚠️")
 
     st.divider()
 
-    run = st.button("🔎 Run audit", type="primary")
-    if run:
-        text = get_ads_text().strip()
-        if not text:
-            st.warning("Please fetch, upload, or paste an ads.txt first (or click “Try sample ads.txt”).")
+    # Run audit
+    if st.button("🔎 Run audit", type="primary"):
+        text = get_effective_text(uploaded)
+        if not text.strip():
+            st.warning("Please upload or paste an ads.txt (or fetch one).")
             st.stop()
 
+        # Source label for report
+        source_label = st.session_state.get("input_source", "Manual input")
+        fetched_url = st.session_state.get("fetched_url")
+        if fetched_url:
+            source_label = f"{source_label} • {fetched_url}"
+
+        # Phase 1 analysis (optional signals hardcoded ON)
         with st.spinner("Analyzing ads.txt…"):
             report = analyze_ads_txt(
                 text=text,
-                source_label=get_source_label(),
-                include_optional_checks=include_optional,
+                source_label=source_label,
+                include_optional_checks=INCLUDE_OPTIONAL_SIGNALS_ALWAYS,
             )
 
-        sellers_json_result = None
-        if verify_sellers:
-            with st.spinner("Verifying seller accounts via sellers.json…"):
-                sellers_json_result = run_sellers_json_verification(
-                    ads_txt=text,
-                    max_domains=max_domains,
-                    sleep_between=0.25,
-                )
+        # Phase 2 sellers.json verification (hardcoded ON)
+        sellers_section = None
+        if VERIFY_SELLER_ACCOUNTS_ALWAYS:
+            with st.spinner("Verifying seller accounts via sellers.json (this can take a bit)…"):
+                try:
+                    sellers_section = run_sellers_json_verification(text)
+                except TypeError:
+                    # In case your function signature differs
+                    sellers_section = run_sellers_json_verification(ads_txt_text=text)
+                except Exception as e:
+                    sellers_section = {"error": str(e), "ok": False}
 
-            report.setdefault("meta", {})["sellers_json_checks"] = True
-            report.setdefault("summary", {})["sellers_json"] = sellers_json_result.get("summary", {})
-            report.setdefault("findings", [])
-            report["findings"].extend(sellers_json_result.get("findings", []))
+        # Merge seller verification into report (safe)
+        if isinstance(report, dict) and sellers_section is not None:
+            report["sellers_json_verification"] = sellers_section
 
-        top = st.columns([1.1, 1.1, 1.1, 1.7])
-        top[0].metric("Risk score", report["summary"]["risk_score"])
-        top[1].metric("Risk level", report["summary"]["risk_level"])
-        top[2].metric("Findings", report["summary"]["finding_count"])
-        top[3].metric("Entries", report["summary"]["entry_count"])
+        # ---- Render summary ----
+        findings = safe_get_findings(report)
+        total_entries = report.get("total_entries") or report.get("entries") or report.get("lines") or None
+        risk_score = report.get("risk_score")
+        risk_level = report.get("risk_level") or report.get("overall_risk") or "—"
 
-        if sellers_json_result:
-            s = sellers_json_result.get("summary", {})
-            st.subheader("Seller verification summary (sellers.json)")
-            cA, cB, cC, cD = st.columns(4)
-            cA.metric("Domains checked", s.get("domains_checked", 0))
-            cB.metric("Reachable", s.get("reachable", 0))
-            cC.metric("Unreachable", s.get("unreachable", 0))
-            cD.metric("Avg match rate", s.get("avg_match_rate", 0.0))
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Risk score", str(risk_score) if risk_score is not None else "—")
+        m2.metric("Risk level", str(risk_level))
+        m3.metric("Findings", str(len(findings)))
+        m4.metric("Entries", str(total_entries) if total_entries is not None else "—")
 
-            avg = float(s.get("avg_match_rate", 0.0) or 0.0)
-            unr = int(s.get("unreachable", 0) or 0)
-            interp, action = explain_match_rate(avg, unr)
+        # Short narrative summary (robust)
+        sev_counts: Dict[str, int] = {}
+        for f in findings:
+            sev = (f.get("severity") or f.get("level") or "UNKNOWN").upper()
+            sev_counts[sev] = sev_counts.get(sev, 0) + 1
 
-            st.info(interp)
-            st.success(action)
-
-            st.caption(
-                "Tip: If some domains are blocked or rate-limited, verification may be incomplete. "
-                "This is why sellers.json checks are treated as additional evidence, not the only truth."
+        if findings:
+            st.subheader("Summary")
+            st.write(
+                f"Found **{len(findings)}** buyer-relevant flags. Breakdown: "
+                + ", ".join([f"**{k}**: {v}" for k, v in sorted(sev_counts.items(), key=lambda x: (-x[1], x[0]))])
             )
-
-        findings = report.get("findings", [])
-        if not findings:
-            st.success("No red flags detected by the current rule set.")
         else:
-            st.subheader("Themes summary")
-            buckets = group_findings_by_theme(findings)
+            st.info("No findings detected (based on current rule set).")
 
-            theme_cols = st.columns(min(4, max(1, len(buckets))))
-            for i, (theme, fs) in enumerate(list(buckets.items())[:4]):
-                sev = max_severity(fs)
-                badge = SEV_BADGE.get(sev, "🟦")
-                theme_cols[i].metric(f"{badge} {theme}", len(fs))
+        st.subheader("Buyer-relevant red flags")
+        if not findings:
+            st.write("Nothing to show yet.")
+        else:
+            # Show first 50 expanded list (keep page readable)
+            for i, f in enumerate(findings[:50], start=1):
+                title = f.get("title") or f.get("name") or "Finding"
+                sev = (f.get("severity") or f.get("level") or "UNKNOWN").upper()
+                why = f.get("why") or f.get("buyer_impact") or f.get("message") or ""
+                evidence = f.get("evidence") or ""
+                line_no = f.get("line") or f.get("line_no")
 
-            for theme, fs in buckets.items():
-                sev = max_severity(fs)
-                badge = SEV_BADGE.get(sev, "🟦")
-                info = THEME_INFO.get(theme, {})
-                why = info.get("why", "Grouped issues for easier review.")
-                questions = info.get("questions", [])
+                header = f"[{sev}] {title}"
+                with st.expander(header, expanded=(i <= 5)):
+                    if why:
+                        st.write(why)
+                    if line_no is not None:
+                        st.caption(f"Line: {line_no}")
+                    if evidence:
+                        st.code(str(evidence)[:2000])
 
-                top_rules = top_rule_counts_in_theme(fs, n=3)
-                top_rules_str = ", ".join([f"{rid} ({cnt})" for rid, cnt in top_rules]) if top_rules else "—"
+            if len(findings) > 50:
+                st.caption(f"Showing first 50 of {len(findings)} findings.")
 
-                with st.expander(f"{badge} {theme} — {len(fs)} signals (max severity: {sev})", expanded=False):
-                    st.markdown(f"**Why it matters:** {why}")
-                    st.markdown(f"**Most repeated signals:** {top_rules_str}")
+        # Show sellers.json section if present
+        if sellers_section is not None:
+            st.subheader("Seller verification (sellers.json)")
+            if isinstance(sellers_section, dict) and sellers_section.get("error"):
+                st.warning(f"Sellers.json verification ran but returned an error: {sellers_section.get('error')}")
+                st.caption("This is common when domains block automated fetching. The ads.txt audit still works.")
+            else:
+                st.json(sellers_section)
 
-                    if questions:
-                        st.markdown("**Questions to ask:**")
-                        for q in questions:
-                            st.markdown(f"- {q}")
+        # Downloads
+        st.subheader("Export")
+        json_bytes = None
+        try:
+            import json
 
-                    st.markdown("**Example evidence (first 5):**")
-                    shown = 0
-                    for f in fs:
-                        ev = f.get("evidence", {})
-                        ln = ev.get("line_no")
-                        line = ev.get("line", "")
-                        title = f.get("title", "Finding")
-                        if line:
-                            st.caption(f"- {title}")
-                            if ln is not None:
-                                st.code(f"Line {ln}: {line}".strip())
-                            else:
-                                st.code(line.strip())
-                            shown += 1
-                        if shown >= 5:
-                            break
-                    if len(fs) > 5:
-                        st.caption(f"Showing 5 examples out of {len(fs)}. Use CSV export for the full list.")
+            json_bytes = json.dumps(report, indent=2).encode("utf-8")
+        except Exception:
+            json_bytes = str(report).encode("utf-8", errors="ignore")
 
-        st.subheader("Exports")
-        dl = st.columns([1, 1, 1, 1])
-        dl[0].download_button(
-            "⬇️ JSON",
-            data=report_to_json_bytes(report),
+        st.download_button(
+            "⬇️ Download JSON report",
+            data=json_bytes,
             file_name="adchainaudit_report.json",
             mime="application/json",
-            use_container_width=True,
-        )
-        dl[1].download_button(
-            "⬇️ TXT",
-            data=report_to_txt_bytes(report),
-            file_name="adchainaudit_report.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
-        dl[2].download_button(
-            "⬇️ CSV",
-            data=report_to_csv_bytes(report),
-            file_name="adchainaudit_findings.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        dl[3].download_button(
-            "⬇️ Sample ads.txt",
-            data=load_sample_text().encode("utf-8", errors="replace"),
-            file_name="sample_thestar_ads_20251214.txt",
-            mime="text/plain",
-            use_container_width=True,
         )
 
     st.caption("Built in public. Feedback, feature ideas, and collaborators welcome 🤝")
