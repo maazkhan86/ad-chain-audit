@@ -60,69 +60,90 @@ def parse_ads_txt_entries(text: str) -> List[Tuple[int, str, str, str]]:
         if len(parts) < 2:
             continue
         domain = _normalize_domain(parts[0])
-        seller_id = parts[1].strip()
-        if domain and seller_id:
-            out.append((i, cleaned, domain, seller_id))
+        seller_id = parts[1]
+        out.append((i, cleaned, domain, seller_id))
     return out
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=128)
 def _cached_fetch(domain: str):
-    # Cache per domain for the life of the Streamlit process.
+    # Hardcode: try HTTPS first, then fallback inside sellers_json_checks if it does so.
+    # If sellers_json_checks does not fallback, we still keep the UI messaging in app.py.
     return fetch_sellers_json(domain)
 
 
-def _safe_upper(x) -> str:
-    if x is None:
-        return ""
-    return str(x).strip().upper()
+def _safe_upper(x: Optional[str]) -> str:
+    return (x or "").strip().upper()
 
 
-def run_sellers_json_verification(
-    ads_txt: str,
-    *,
-    max_domains: int = 25,
-    sleep_between: float = 0.25,
-    missing_sample_size: int = 8,
-    intermediary_sample_size: int = 6,
-    confidential_sample_size: int = 6,
-) -> Dict:
+def _looks_agency_like(name: str) -> bool:
     """
-    Phase 2:
-      - Extract unique ad_system domains
-      - Fetch /sellers.json per domain (cached)
-      - Check whether ads.txt seller IDs exist in sellers.json
-      - NEW: detect INTERMEDIARY/BOTH sellers + confidential sellers
-      - Return: summary + aggregated findings (dicts compatible with Phase 1 report)
+    Best-effort heuristic. Not authoritative.
+    """
+    n = (name or "").lower()
+    keywords = [
+        "groupm", "mindshare", "wavemaker", "essence", "mec", "mediacom",
+        "xaxis", "amnet", "dentsu", "carat", "iprospect",
+        "publicis", "omnicom", "interpublic", "ipg", "wpp",
+        "trading desk", "td", "programmatic",
+    ]
+    return any(k in n for k in keywords)
+
+
+def run_sellers_json_verification(ads_txt: str) -> Dict:
+    """
+    Verifies seller IDs found in ads.txt against sellers.json for each ad system domain.
+
+    Output:
+      {
+        "summary": {...},
+        "domain_stats": [...],
+        "findings": [...]
+      }
     """
     entries = parse_ads_txt_entries(ads_txt)
 
+    # domain -> set(seller_ids), plus example line
     domain_to_ids: Dict[str, set] = defaultdict(set)
-    domain_to_example_line: Dict[str, Tuple[int, str]] = {}
-
-    for line_no, raw_line, domain, seller_id in entries:
+    domain_to_example_line: Dict[str, str] = {}
+    for line_no, line, domain, seller_id in entries:
         domain_to_ids[domain].add(seller_id)
-        if domain not in domain_to_example_line:
-            domain_to_example_line[domain] = (line_no, raw_line)
+        domain_to_example_line.setdefault(domain, f"Line {line_no}: {line}")
 
-    domains = list(domain_to_ids.keys())[:max_domains]
-
+    domains = sorted(domain_to_ids.keys())
+    domain_stats: List[Dict] = []
     findings: List[Finding] = []
 
-    reachable = 0
-    unreachable = 0
     total_ids = 0
     total_matched = 0
-    domain_stats = []
+    reachable = 0
+    unreachable = 0
+
+    sleep_between = 0.15  # be polite
 
     for domain in domains:
-        seller_ids = sorted(list(domain_to_ids[domain]))
+        seller_ids = sorted(domain_to_ids[domain])
         total_ids += len(seller_ids)
 
         res = _cached_fetch(domain)
-        if not res.ok or not res.data:
+
+        if not getattr(res, "ok", False):
             unreachable += 1
-            ex_ln, ex_line = domain_to_example_line.get(domain, (None, ""))
+            domain_stats.append(
+                {
+                    "domain": domain,
+                    "json_ok": False,
+                    "status": getattr(res, "status", None),
+                    "seller_ids_in_ads_txt": len(seller_ids),
+                    "seller_ids_matched": 0,
+                    "match_rate": 0.0,
+                    "error": getattr(res, "error", "Fetch failed"),
+                    "seller_type_mix": {},
+                    "intermediary_examples": [],
+                    "agency_like_examples": [],
+                }
+            )
+
             findings.append(
                 Finding(
                     rule_id="SELLERS_JSON_UNREACHABLE",
@@ -131,21 +152,10 @@ def run_sellers_json_verification(
                     why_buyer_cares="If sellers.json cannot be retrieved, seller verification is limited and supply-path transparency is weaker.",
                     recommendation="Treat as a transparency gap. Ask the seller/exchange whether they publish sellers.json correctly.",
                     evidence=Evidence(
-                        line_no=ex_ln,
-                        line=f"{domain}/sellers.json → {res.error or 'unreachable'} | example ads.txt: {ex_line}",
+                        line_no=None,
+                        line=f"{domain}/sellers.json → {getattr(res, 'error', 'unreachable')} | {domain_to_example_line.get(domain,'')}",
                     ),
                 )
-            )
-            domain_stats.append(
-                {
-                    "domain": domain,
-                    "json_ok": False,
-                    "status": res.status,
-                    "seller_ids_in_ads_txt": len(seller_ids),
-                    "seller_ids_matched": 0,
-                    "match_rate": 0.0,
-                    "error": res.error,
-                }
             )
             time.sleep(sleep_between)
             continue
@@ -155,38 +165,55 @@ def run_sellers_json_verification(
 
         matched = 0
         missing: List[str] = []
+        seller_type_mix: Dict[str, int] = defaultdict(int)
 
-        # NEW: collect intermediary + confidential sellers among matched IDs
-        intermediary_hits: List[str] = []
-        confidential_hits: List[str] = []
+        intermediary_examples: List[str] = []
+        agency_like_examples: List[str] = []
 
+        # matched entries details
         for sid in seller_ids:
-            rec = idx.get(str(sid))
-            if rec is not None:
-                matched += 1
+            entry = idx.get(sid)
+            if entry is None:
+                missing.append(sid)
+                continue
 
-                seller_type = _safe_upper(rec.get("seller_type"))
-                # INTERMEDIARY or BOTH suggests extra hops / reselling
-                if seller_type in {"INTERMEDIARY", "BOTH"} and len(intermediary_hits) < intermediary_sample_size:
-                    name = rec.get("name") or ""
-                    intermediary_hits.append(f"{sid} ({seller_type}) {name}".strip())
+            matched += 1
+            stype = _safe_upper(entry.get("seller_type") if isinstance(entry, dict) else None)
+            seller_type_mix[stype or "UNKNOWN"] += 1
 
-                is_conf = rec.get("is_confidential")
-                if is_conf is True and len(confidential_hits) < confidential_sample_size:
-                    name = rec.get("name") or ""
-                    confidential_hits.append(f"{sid} (confidential) {name}".strip())
-            else:
-                if len(missing) < missing_sample_size:
-                    missing.append(str(sid))
+            name = ""
+            if isinstance(entry, dict):
+                name = entry.get("name") or ""
 
+            # Collect a few intermediary examples
+            if stype in {"INTERMEDIARY", "BOTH"} and len(intermediary_examples) < 6:
+                intermediary_examples.append(f"{sid} ({stype}) {name}".strip())
+
+            # Collect a few agency/trading-desk-like names (best-effort)
+            if name and _looks_agency_like(name) and len(agency_like_examples) < 6:
+                agency_like_examples.append(f"{sid} ({stype}) {name}".strip())
+
+        match_rate = (matched / max(1, len(seller_ids)))
         total_matched += matched
-        match_rate = (matched / len(seller_ids)) if seller_ids else 0.0
 
-        # Aggregate missing seller IDs into a single finding per domain (keeps report readable)
-        if matched < len(seller_ids):
-            ex_ln, ex_line = domain_to_example_line.get(domain, (None, ""))
-            missing_count = len(seller_ids) - matched
-            sample_txt = ", ".join(missing) if missing else "—"
+        domain_stats.append(
+            {
+                "domain": domain,
+                "json_ok": True,
+                "status": getattr(res, "status", 200),
+                "seller_ids_in_ads_txt": len(seller_ids),
+                "seller_ids_matched": matched,
+                "match_rate": round(match_rate, 3),
+                "error": None,
+                "seller_type_mix": dict(sorted(seller_type_mix.items(), key=lambda x: x[1], reverse=True)),
+                "intermediary_examples": intermediary_examples,
+                "agency_like_examples": agency_like_examples,
+            }
+        )
+
+        # Finding: missing seller ids
+        if missing:
+            examples = ", ".join(missing[:8])
             findings.append(
                 Finding(
                     rule_id="SELLER_ID_NOT_FOUND_IN_SELLERS_JSON",
@@ -195,18 +222,14 @@ def run_sellers_json_verification(
                     why_buyer_cares="When a seller account in ads.txt cannot be validated against sellers.json, it raises questions about authorization accuracy, stale configs, or unclear selling relationships.",
                     recommendation="Ask the publisher/seller to confirm the correct seller account ID and preferred path (DIRECT where possible).",
                     evidence=Evidence(
-                        line_no=ex_ln,
-                        line=(
-                            f"{domain}: missing {missing_count}/{len(seller_ids)} seller IDs in sellers.json. "
-                            f"Examples: {sample_txt}. | example ads.txt: {ex_line}"
-                        ),
+                        line_no=None,
+                        line=f"{domain}: missing {len(missing)}/{len(seller_ids)} seller IDs. Examples: {examples}. | {domain_to_example_line.get(domain,'')}",
                     ),
                 )
             )
 
-        # NEW: Intermediary sellers signal
-        if intermediary_hits:
-            ex_ln, ex_line = domain_to_example_line.get(domain, (None, ""))
+        # Finding: intermediary sellers present
+        if intermediary_examples:
             findings.append(
                 Finding(
                     rule_id="SELLERS_JSON_INTERMEDIARY_SELLERS_PRESENT",
@@ -215,51 +238,15 @@ def run_sellers_json_verification(
                     why_buyer_cares="Intermediary seller types can indicate additional hops and reselling, which may increase fees and reduce transparency. It is not always bad, but it is worth asking why this path is needed.",
                     recommendation="Ask for the preferred path for your buy and whether a more direct route exists (DIRECT where possible).",
                     evidence=Evidence(
-                        line_no=ex_ln,
-                        line=(
-                            f"{domain}: example intermediary seller IDs from sellers.json → "
-                            f"{', '.join(intermediary_hits)} | example ads.txt: {ex_line}"
-                        ),
+                        line_no=None,
+                        line=f"{domain}: examples → " + " | ".join(intermediary_examples[:6]),
                     ),
                 )
             )
-
-        # NEW: Confidential sellers signal
-        if confidential_hits:
-            ex_ln, ex_line = domain_to_example_line.get(domain, (None, ""))
-            findings.append(
-                Finding(
-                    rule_id="SELLERS_JSON_CONFIDENTIAL_SELLERS_PRESENT",
-                    severity="LOW",
-                    title="Confidential sellers detected (reduced transparency)",
-                    why_buyer_cares="Confidential sellers can limit transparency and make verification harder. This is not automatically a red flag, but it reduces auditability.",
-                    recommendation="If significant spend is routed through confidential sellers, ask the seller/publisher to clarify the relationship and preferred authorized path.",
-                    evidence=Evidence(
-                        line_no=ex_ln,
-                        line=(
-                            f"{domain}: example confidential sellers from sellers.json → "
-                            f"{', '.join(confidential_hits)} | example ads.txt: {ex_line}"
-                        ),
-                    ),
-                )
-            )
-
-        domain_stats.append(
-            {
-                "domain": domain,
-                "json_ok": True,
-                "status": res.status,
-                "seller_ids_in_ads_txt": len(seller_ids),
-                "seller_ids_matched": matched,
-                "match_rate": round(match_rate, 3),
-                "error": None,
-            }
-        )
 
         time.sleep(sleep_between)
 
-    avg_match_rate = (total_matched / total_ids) if total_ids else 0.0
-
+    avg_match_rate = (total_matched / max(1, total_ids))
     summary = {
         "domains_checked": len(domains),
         "reachable": reachable,
