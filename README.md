@@ -82,15 +82,18 @@ ads.txt changes over time. Treat this as demo input only.
 ## 🧠 Roadmap (where this is going)
 
 ### Phase 1 — Ads.txt hardening
-✅ Ads.txt parsing + validation  
-✅ Risk scoring + red-flag report  
-⬜ Domain mode: `example.com` → fetch `https://example.com/ads.txt`  
+✅ Ads.txt parsing + validation
+✅ Risk scoring + buyer-friendly red-flag report (with line-level evidence)
+✅ Domain mode: example.com → auto-fetch https://example.com/ads.txt (falls back to HTTP if needed; guides to upload/paste if blocked)
+✅ Demo mode: load a bundled sample ads.txt for instant testing
 ⬜ Change detection: diff + alerts (new sellers, new resellers, new risk)
 
 ### Phase 2 — Seller verification (sellers.json)
-✅ Fetch/validate sellers.json per ad system (when accessible)  
-✅ Verify seller IDs + seller type + declared domains (when available)  
-⬜ Evidence locker (store fetched artifacts + timestamps)
+✅ Fetch/validate sellers.json per ad system (when accessible; HTTPS→HTTP fallback, handles blocked/non-JSON)
+✅ Verify seller IDs (ads.txt ↔ sellers.json) + surface intermediary seller signals (when available)
+✅ Buyer-friendly summary view (reachability + match rate + worst-match table + actionable “what to do next”)
+✅ Evidence locker + buyer pack ZIP (store fetched artifacts + timestamps + outputs for reproducibility)
+⬜ Portfolio mode: scan multiple publishers in one run + export consolidated report
 
 ### Phase 3 — Full supply-chain graph
 ⬜ Parse and map `schain` into a hop graph  
