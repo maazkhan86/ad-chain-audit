@@ -3,13 +3,11 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import re
 import zipfile
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -25,7 +23,7 @@ except Exception:  # pragma: no cover
     run_sellers_json_verification = None  # type: ignore
 
 
-APP_VERSION = "0.8"
+APP_VERSION = "0.9"
 EVIDENCE_DIR = Path("evidence")
 SAMPLES_DIR = Path("samples")
 DEMO_SAMPLE_PATH = SAMPLES_DIR / "ads.txt"
@@ -34,6 +32,8 @@ DEMO_SNAPSHOT_NOTE = (
     "Sample snapshot source: thestar.com.my/ads.txt (captured 14 Dec 2025). "
     "ads.txt changes over time; treat this as a demo input."
 )
+
+GITHUB_URL = "https://github.com/maazkhan86/AdChainAudit"
 
 
 # -----------------------------
@@ -52,10 +52,12 @@ def _looks_like_url(s: str) -> bool:
 
 
 def _normalize_domain(s: str) -> str:
-    s = s.strip()
+    s = (s or "").strip()
     s = re.sub(r"^https?://", "", s, flags=re.I)
     s = s.split("/", 1)[0]
-    return s.strip()
+    s = s.strip()
+    s = re.sub(r"^www\.", "", s, flags=re.I)
+    return s
 
 
 def build_ads_txt_candidates(domain_or_url: str) -> Tuple[str, ...]:
@@ -70,10 +72,7 @@ def build_ads_txt_candidates(domain_or_url: str) -> Tuple[str, ...]:
         return tuple()
 
     if _looks_like_url(s):
-        url = s
-        if url.lower().endswith("/"):
-            url = url[:-1]
-        # If user typed a site root, assume /ads.txt
+        url = s.rstrip("/")
         if not url.lower().endswith(".txt"):
             url = url + "/ads.txt"
         http_variant = re.sub(r"^https://", "http://", url, flags=re.I)
@@ -84,11 +83,10 @@ def build_ads_txt_candidates(domain_or_url: str) -> Tuple[str, ...]:
         return tuple()
 
     https_main = f"https://{d}/ads.txt"
-    https_www = f"https://www.{d}/ads.txt" if not d.lower().startswith("www.") else https_main
+    https_www = f"https://www.{d}/ads.txt"
     http_main = f"http://{d}/ads.txt"
-    http_www = f"http://www.{d}/ads.txt" if not d.lower().startswith("www.") else http_main
+    http_www = f"http://www.{d}/ads.txt"
 
-    # keep order + de-dupe
     urls = []
     for u in [https_main, https_www, http_main, http_www]:
         if u not in urls:
@@ -99,7 +97,6 @@ def build_ads_txt_candidates(domain_or_url: str) -> Tuple[str, ...]:
 def fetch_text(url: str, timeout_s: int = 8) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Fetch a URL with a realistic User-Agent. Returns (text, debug_meta).
-    Debug meta is collected always (hardcoded), but only shown selectively in UI.
     """
     meta: Dict[str, Any] = {"url": url, "ok": False, "status": None, "error": None}
 
@@ -118,7 +115,6 @@ def fetch_text(url: str, timeout_s: int = 8) -> Tuple[Optional[str], Dict[str, A
             status = getattr(resp, "status", None)
             meta["status"] = status
             raw = resp.read()
-            # best-effort decode
             try:
                 text = raw.decode("utf-8")
             except Exception:
@@ -154,9 +150,9 @@ def fetch_ads_txt(domain_or_url: str) -> Tuple[Optional[str], Dict[str, Any]]:
     return None, debug
 
 
-def safe_pct(x: Any) -> str:
+def safe_pct(x: Any, decimals: int = 0) -> str:
     try:
-        return f"{float(x) * 100:.0f}%"
+        return f"{float(x) * 100:.{decimals}f}%"
     except Exception:
         return "—"
 
@@ -183,9 +179,9 @@ def evidence_write_run(
     fetch_debug: Optional[Dict[str, Any]],
 ) -> Optional[Path]:
     """
-    Evidence locker (Phase 2 add-on):
+    Evidence pack (app-side):
     - Stores inputs + outputs with timestamp under ./evidence/<timestamp>_<source>/
-    - Helps reproducibility and provides “receipts” for internal sharing.
+    - Lets users download a “buyer pack ZIP”.
     """
     try:
         EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
@@ -199,11 +195,7 @@ def evidence_write_run(
         (run_dir / "audit_report.txt").write_bytes(report_to_txt_bytes(audit_report))
         (run_dir / "audit_report.csv").write_bytes(report_to_csv_bytes(audit_report))
 
-        meta = {
-            "generated_at": now_iso(),
-            "app_version": APP_VERSION,
-            "source_label": source_label,
-        }
+        meta = {"generated_at": now_iso(), "app_version": APP_VERSION, "source_label": source_label}
         if fetch_debug:
             meta["fetch_debug"] = fetch_debug
         (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -216,7 +208,6 @@ def evidence_write_run(
 
         return run_dir
     except Exception:
-        # Don’t break the app if storage isn’t available.
         return None
 
 
@@ -237,9 +228,9 @@ def call_sellers_verification(ads_txt_text: str) -> Optional[Dict[str, Any]]:
         return None
 
     fn = run_sellers_json_verification
-    # Try common signatures safely.
+
     for kwargs in [
-        {},  # run_sellers_json_verification(text)
+        {},  # fn(text)
         {"ads_txt_text": ads_txt_text},
         {"text": ads_txt_text},
         {"ads_txt": ads_txt_text},
@@ -263,17 +254,143 @@ def call_sellers_verification(ads_txt_text: str) -> Optional[Dict[str, Any]]:
                         "title": "Seller verification failed",
                         "why_buyer_cares": "Seller verification could not be completed in this run.",
                         "recommendation": "Try again, or proceed with Phase 1 signals only.",
-                        "evidence": {"line_no": None, "line": str(e)},
+                        "evidence": {"error": str(e)},
                         "rule_id": "SELLERS_JSON_RUNTIME_ERROR",
                     }
                 ],
             }
 
-    # If all signatures fail:
     return {
         "summary": {"error": "Could not call run_sellers_json_verification (signature mismatch)."},
         "domain_stats": [],
         "findings": [],
+    }
+
+
+def _short_reason(d: Dict[str, Any], max_len: int = 140) -> str:
+    r = d.get("error") or ""
+    r = str(r).strip()
+    if not r:
+        status = d.get("status")
+        if status:
+            r = f"HTTP {status}"
+        else:
+            r = "Blocked / unreachable"
+    r = r.replace("\n", " ").strip()
+    return (r[:max_len] + "…") if len(r) > max_len else r
+
+
+def _summarize_sellers_findings_for_humans(sellers_report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Turns Phase 2 output into a short, readable summary.
+    Returns:
+      - headline
+      - bullets
+      - tables: worst_reachable, blocked
+      - notable: top_missing, top_intermediary, top_unreachable
+    """
+    ssum = sellers_report.get("summary", {}) or {}
+    domain_stats = sellers_report.get("domain_stats", []) or []
+
+    domains_checked = clamp_int(ssum.get("domains_checked"), 0, 10**9, 0)
+    reachable = clamp_int(ssum.get("reachable"), 0, 10**9, 0)
+    unreachable = clamp_int(ssum.get("unreachable"), 0, 10**9, 0)
+
+    total_ids = clamp_int(ssum.get("total_seller_ids_checked"), 0, 10**12, 0)
+    matched_ids = clamp_int(ssum.get("total_seller_ids_matched"), 0, 10**12, 0)
+    avg_match = ssum.get("avg_match_rate", None)
+
+    not_matched = max(0, total_ids - matched_ids)
+
+    # Buckets
+    blocked: List[Dict[str, Any]] = []
+    reachable_rows: List[Dict[str, Any]] = []
+    for d in domain_stats:
+        json_ok = bool(d.get("json_ok", False))
+        status = d.get("status", None)
+        err = d.get("error", None)
+        if (not json_ok) or err or (isinstance(status, int) and status != 200):
+            blocked.append(d)
+        else:
+            reachable_rows.append(d)
+
+    reachable_sorted = sorted(reachable_rows, key=lambda x: (x.get("match_rate") or 0))
+    worst10 = reachable_sorted[:10]
+
+    # Notable issues from findings
+    findings = sellers_report.get("findings", []) or []
+    top_missing: List[Dict[str, Any]] = []
+    top_inter: List[Dict[str, Any]] = []
+    top_unreach: List[Dict[str, Any]] = []
+
+    for f in findings:
+        rid = str(f.get("rule_id", "")).strip()
+        ev = f.get("evidence", {}) or {}
+        dom = ev.get("domain") or ev.get("used_url") or ""
+        if rid == "SELLER_ID_NOT_FOUND_IN_SELLERS_JSON":
+            top_missing.append(
+                {
+                    "Domain": ev.get("domain"),
+                    "Missing IDs": ev.get("missing_count"),
+                    "Total IDs": ev.get("total_in_ads_txt"),
+                    "Examples": ev.get("examples"),
+                }
+            )
+        elif rid == "SELLERS_JSON_INTERMEDIARY_SELLERS_PRESENT":
+            top_inter.append(
+                {
+                    "Domain": ev.get("domain"),
+                    "Examples": ev.get("examples"),
+                }
+            )
+        elif rid == "SELLERS_JSON_UNREACHABLE":
+            top_unreach.append(
+                {
+                    "Domain": ev.get("domain"),
+                    "Status": ev.get("status"),
+                    "Reason": _short_reason(ev, 200),
+                }
+            )
+
+    # Sort missing by missing_count desc
+    def _mc(x: Dict[str, Any]) -> int:
+        return clamp_int(x.get("Missing IDs"), 0, 10**9, 0)
+
+    top_missing = sorted(top_missing, key=_mc, reverse=True)[:8]
+    top_inter = top_inter[:6]
+    top_unreach = top_unreach[:10]
+
+    # Human headline
+    coverage = safe_pct(avg_match, decimals=0) if avg_match is not None else "—"
+    headline = f"Verified **{matched_ids:,}** of **{total_ids:,}** seller IDs ({coverage}) across **{domains_checked}** seller systems."
+
+    bullets: List[str] = []
+    if unreachable > 0:
+        bullets.append(f"**{unreachable}** seller systems could not be verified (blocked/unreachable/not JSON).")
+    if not_matched > 0:
+        bullets.append(f"**{not_matched:,}** seller IDs from ads.txt did not appear in sellers.json (needs follow-up).")
+    if reachable > 0 and (avg_match is not None) and float(avg_match) < 0.5:
+        bullets.append("Overall match is **below 50%**. Treat this as a transparency check, not a final verdict.")
+    if not bullets:
+        bullets.append("Most sellers.json files were reachable and verification looks reasonably clean.")
+
+    return {
+        "metrics": {
+            "domains_checked": domains_checked,
+            "reachable": reachable,
+            "unreachable": unreachable,
+            "total_ids": total_ids,
+            "matched_ids": matched_ids,
+            "not_matched": not_matched,
+            "avg_match": avg_match,
+        },
+        "headline": headline,
+        "bullets": bullets,
+        "worst10_reachable": worst10,
+        "blocked": blocked,
+        "top_missing": top_missing,
+        "top_intermediaries": top_inter,
+        "top_unreachable": top_unreach,
     }
 
 
@@ -286,25 +403,26 @@ st.markdown(
     """
 <style>
 /* App-like feel */
-.block-container { padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1200px; }
+.block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1180px; }
 h1, h2, h3 { letter-spacing: -0.02em; }
 small, .stCaption { opacity: 0.9; }
 
 .card {
   border: 1px solid rgba(49, 51, 63, 0.12);
   border-radius: 16px;
-  padding: 16px 16px;
+  padding: 14px 14px;
   background: white;
   box-shadow: 0 1px 12px rgba(0,0,0,0.04);
 }
-.card-title { font-weight: 700; font-size: 0.95rem; margin-bottom: 10px; opacity: 0.95; }
+.card-title { font-weight: 750; font-size: 0.95rem; margin-bottom: 8px; opacity: 0.95; }
 .muted { opacity: 0.7; }
+
 .pill {
   display: inline-block;
   padding: 6px 10px;
   border-radius: 999px;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 750;
   border: 1px solid rgba(49, 51, 63, 0.12);
   background: rgba(49, 51, 63, 0.03);
   margin-right: 6px;
@@ -321,10 +439,15 @@ small, .stCaption { opacity: 0.9; }
   background: rgba(255, 0, 0, 0.06);
 }
 
+.banner-ok {
+  background: rgba(0,128,0,0.06);
+  border-color: rgba(0,128,0,0.18);
+}
+
 .stButton > button {
   border-radius: 12px !important;
   padding: 10px 14px !important;
-  font-weight: 700 !important;
+  font-weight: 750 !important;
 }
 
 div[data-testid="stMetricValue"] { font-size: 34px; }
@@ -364,8 +487,7 @@ with top_l:
         "Built for media and marketing teams."
     )
 with top_r:
-    # Simple top action
-    st.link_button("GitHub (technical)", "https://github.com/maazkhan86/AdChainAudit", use_container_width=True)
+    st.link_button("GitHub (technical)", GITHUB_URL, use_container_width=True)
 
 st.write("")
 
@@ -376,14 +498,17 @@ c1, c2, c3 = st.columns(3, gap="large")
 
 with c1:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="card-title">1) Get ads.txt</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">1) Fetch ads.txt</div>', unsafe_allow_html=True)
     domain_or_url = st.text_input(
         "Website domain or ads.txt URL",
         placeholder="example.com  or  https://example.com/ads.txt",
         label_visibility="collapsed",
     )
-    fetch_btn = st.button("Fetch ads.txt", use_container_width=True)
-    st.markdown('<div class="muted" style="margin-top:6px;">We try https first, then http. If blocked, upload or paste instead.</div>', unsafe_allow_html=True)
+    fetch_btn = st.button("Fetch", use_container_width=True)
+    st.markdown(
+        '<div class="muted" style="margin-top:6px;">We try https first, then http. If blocked, upload or paste instead.</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
 with c2:
@@ -396,7 +521,12 @@ with c2:
 with c3:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="card-title">3) Paste (optional)</div>', unsafe_allow_html=True)
-    pasted = st.text_area("Paste ads.txt", height=120, placeholder="Paste ads.txt text here…", label_visibility="collapsed")
+    pasted = st.text_area(
+        "Paste ads.txt",
+        height=120,
+        placeholder="Paste ads.txt text here…",
+        label_visibility="collapsed",
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
 # Actions: fetch / upload / demo / paste
@@ -415,7 +545,6 @@ if fetch_btn:
             st.success("Fetched ads.txt successfully ✅")
         else:
             st.error("Couldn’t fetch ads.txt (blocked or not found). Use upload or paste instead.")
-            # Show debug only on failure (hardcoded; no toggle)
             with st.expander("Fetch details (for troubleshooting)"):
                 st.json(dbg)
 
@@ -453,15 +582,20 @@ ads_text = st.session_state.ads_text
 src = st.session_state.ads_source_label
 
 if st.session_state.demo_loaded:
-    st.markdown(f'<div class="banner"><b>Demo sample loaded ✅</b><br/>{DEMO_SNAPSHOT_NOTE}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="banner"><b>Demo sample loaded ✅</b><br/>{DEMO_SNAPSHOT_NOTE}</div>',
+        unsafe_allow_html=True,
+    )
 elif ads_text:
-    st.markdown(f'<div class="banner" style="background: rgba(0,128,0,0.06); border-color: rgba(0,128,0,0.18);"><b>Input ready ✅</b><br/><span class="muted">Source: {src}</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="banner banner-ok"><b>Input ready ✅</b><br/><span class="muted">Source: {src}</span></div>',
+        unsafe_allow_html=True,
+    )
 else:
     st.info("Add an ads.txt input (fetch, upload, or paste) to run the audit.")
 
 st.write("")
 
-# Run button (always-on Phase 2 & optional checks are hardcoded ON)
 run_col_l, run_col_r = st.columns([3, 2])
 with run_col_r:
     run = st.button("Run audit", type="primary", use_container_width=True)
@@ -473,22 +607,18 @@ if run:
         st.warning("Please add ads.txt input first (fetch, upload, or paste).")
     else:
         with st.spinner("Analyzing ads.txt…"):
-            # Hardcoded ON (per your feedback)
-            include_optional_checks = True
             audit_report = analyze_ads_txt(
                 text=ads_text,
                 source_label=src or "ads.txt",
-                include_optional_checks=include_optional_checks,
+                include_optional_checks=True,  # hardcoded ON
             )
 
-        sellers_report = None
         with st.spinner("Verifying seller accounts (sellers.json)…"):
             sellers_report = call_sellers_verification(ads_text)
 
         st.session_state.audit_report = audit_report
         st.session_state.sellers_report = sellers_report
 
-        # Evidence locker (always on; silent if storage unavailable)
         ev_path = evidence_write_run(
             ads_txt_text=ads_text,
             source_label=src or "ads.txt",
@@ -498,8 +628,9 @@ if run:
         )
         st.session_state.evidence_path = ev_path
 
+
 # -----------------------------
-# Results
+# Results: Phase 1
 # -----------------------------
 audit_report = st.session_state.audit_report
 sellers_report = st.session_state.sellers_report
@@ -517,10 +648,8 @@ if audit_report:
     m3.metric("Findings", findings_count)
     m4.metric("Entries", entry_count)
 
-    # Summary line
-    rc = sm.get("rule_counts", {}) or {}
-    low = rc.get("LOW", None)  # not used; analyzer uses per-rule counts, not per-severity
     st.subheader("Summary")
+
     # Build severity breakdown from findings list
     sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for f in audit_report.get("findings", []) or []:
@@ -577,7 +706,6 @@ if audit_report:
     st.write("")
     st.subheader("Buyer-relevant red flags")
 
-    # Group findings by severity with expandable sections
     findings = audit_report.get("findings", []) or []
     by_sev: Dict[str, list] = {"CRITICAL": [], "HIGH": [], "MEDIUM": [], "LOW": []}
     for f in findings:
@@ -586,13 +714,11 @@ if audit_report:
             sev = "LOW"
         by_sev[sev].append(f)
 
-    # Show the most important first
     for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
         items = by_sev.get(sev, [])
         if not items:
             continue
         with st.expander(f"{sev} ({len(items)})", expanded=(sev in {"CRITICAL", "HIGH"})):
-            # Keep this readable: show top 60, and provide count
             max_show = 60
             for i, f in enumerate(items[:max_show], start=1):
                 ev = f.get("evidence", {}) or {}
@@ -619,129 +745,173 @@ if audit_report:
 
     st.divider()
 
+
 # -----------------------------
-# Phase 2: sellers.json (summarized output)
+# Results: Phase 2 (clean summary)
 # -----------------------------
 if sellers_report:
-    st.subheader("Seller verification (sellers.json) — summary")
+    st.subheader("Seller verification (sellers.json)")
 
-    ssum = sellers_report.get("summary", {}) or {}
-    domains_checked = clamp_int(ssum.get("domains_checked"), 0, 10**9, 0)
-    reachable = clamp_int(ssum.get("reachable"), 0, 10**9, 0)
-    unreachable = clamp_int(ssum.get("unreachable"), 0, 10**9, 0)
-    total_ids = clamp_int(ssum.get("total_seller_ids_checked"), 0, 10**12, 0)
-    matched_ids = clamp_int(ssum.get("total_seller_ids_matched"), 0, 10**12, 0)
-    avg_match = ssum.get("avg_match_rate", None)
+    summary_obj = _summarize_sellers_findings_for_humans(sellers_report)
+    met = summary_obj["metrics"]
 
     p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Seller systems checked", domains_checked)
-    p2.metric("Reachable sellers.json", reachable)
-    p3.metric("Unreachable / blocked", unreachable)
-    p4.metric("Avg match rate", safe_pct(avg_match))
+    p1.metric("Seller systems checked", met["domains_checked"])
+    p2.metric("Reachable sellers.json", met["reachable"])
+    p3.metric("Unreachable / blocked", met["unreachable"])
+    p4.metric("Verified seller IDs", f"{met['matched_ids']:,}")
 
+    st.markdown(f"**{summary_obj['headline']}**")
     st.caption(
-        "Match rate compares seller IDs seen in ads.txt to seller_id entries found in each ad system’s sellers.json. "
-        "Low match rate can mean stale ads.txt entries, non-standard endpoints, or unclear selling relationships."
+        "This is a verification layer. A low match rate can mean stale ads.txt entries, non-standard endpoints, "
+        "or unclear selling relationships. Use it to ask better questions."
     )
-
-    domain_stats = sellers_report.get("domain_stats", []) or []
-
-    # Build quick buckets
-    low_match = []
-    ok_match = []
-    blocked = []
-    for d in domain_stats:
-        status = d.get("status", None)
-        json_ok = bool(d.get("json_ok", False))
-        mr = d.get("match_rate", 0) or 0
-        dom = d.get("domain", "")
-        err = d.get("error", None)
-        if not json_ok or status is None or (isinstance(status, int) and status >= 400) or err:
-            blocked.append(d)
-        elif mr < 0.2:
-            low_match.append(d)
-        else:
-            ok_match.append(d)
 
     # Pills
     st.markdown(
         f"""
-<span class="pill pill-ok">Good / usable: {len(ok_match)}</span>
-<span class="pill pill-warn">Low match (&lt;20%): {len(low_match)}</span>
-<span class="pill pill-bad">Unreachable / not JSON: {len(blocked)}</span>
+<span class="pill pill-ok">Reachable: {met["reachable"]}</span>
+<span class="pill pill-bad">Unreachable: {met["unreachable"]}</span>
+<span class="pill pill-warn">Not verified: {met["not_matched"]:,}</span>
 """,
         unsafe_allow_html=True,
     )
 
-    # Show a clean table: Top issues + worst match
-    # Keep it simple: show top 10 worst reachable + list blocked domains
-    reachable_rows = [d for d in domain_stats if d.get("json_ok") and d.get("status") == 200]
-    reachable_sorted = sorted(reachable_rows, key=lambda x: (x.get("match_rate") or 0))
-    worst10 = reachable_sorted[:10]
+    # Buyer takeaway (simple)
+    st.markdown("**What to do with this**")
+    for b in summary_obj["bullets"]:
+        st.markdown(f"- {b}")
+    st.markdown(
+        "- If you see **unreachable** sellers.json, treat it as a transparency gap.\n"
+        "- If you see **large missing counts**, ask for the **preferred path** and whether **DIRECT** is available.\n"
+        "- If intermediary sellers appear, it may add hops and fees. It is not always bad, but it is worth clarifying."
+    )
 
+    # Tables (kept short)
+    worst10 = summary_obj["worst10_reachable"]
     if worst10:
-        st.markdown("**Worst match (reachable sellers.json):**")
+        st.write("")
+        st.markdown("**Worst match (reachable sellers.json)**")
         table = []
         for d in worst10:
             table.append(
                 {
                     "Domain": d.get("domain"),
-                    "Seller IDs in ads.txt": d.get("seller_ids_in_ads_txt"),
-                    "Matched": d.get("seller_ids_matched"),
+                    "IDs in ads.txt": d.get("seller_ids_in_ads_txt"),
+                    "Verified": d.get("seller_ids_matched"),
                     "Match rate": f"{(d.get('match_rate') or 0):.2f}",
                 }
             )
         st.dataframe(table, use_container_width=True, hide_index=True)
 
+    blocked = summary_obj["blocked"]
     if blocked:
-        st.markdown("**Unreachable / blocked / not JSON (top):**")
+        st.write("")
+        st.markdown("**Unreachable / blocked / not JSON (top)**")
         blk_table = []
         for d in blocked[:12]:
             blk_table.append(
                 {
                     "Domain": d.get("domain"),
                     "Status": d.get("status"),
-                    "Reason": (d.get("error") or "Not JSON / blocked")[:140],
+                    "Reason": _short_reason(d, 150),
                 }
             )
         st.dataframe(blk_table, use_container_width=True, hide_index=True)
 
-    # Turn the verbose findings into a short “what to do next”
-    st.markdown("**What this means for a buyer**")
-    bullets = []
-    if len(low_match) > 0:
-        bullets.append(
-            f"- **{len(low_match)} seller systems have low match**: many seller IDs in ads.txt couldn’t be validated. "
-            "Treat as a transparency question and ask for the preferred path (DIRECT where possible)."
-        )
-    if len(blocked) > 0:
-        bullets.append(
-            f"- **{len(blocked)} seller systems couldn’t be verified** (blocked/unreachable/not JSON). "
-            "That’s a verification gap. You may need seller-side confirmation."
-        )
-    if not bullets:
-        bullets.append(
-            "- Most sellers.json files were reachable and match rates look reasonable. Use this as supporting evidence "
-            "when tightening preferred paths."
-        )
-    st.markdown("\n".join(bullets))
+    # “Notable” findings (human friendly)
+    st.write("")
+    cols = st.columns(3, gap="large")
 
-    # Optional: show detailed findings (still available, but not a wall of JSON)
+    with cols[0]:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="card-title">Biggest missing ID gaps</div>', unsafe_allow_html=True)
+        top_missing = summary_obj["top_missing"]
+        if top_missing:
+            for row in top_missing[:5]:
+                dom = row.get("Domain") or "—"
+                miss = row.get("Missing IDs") or 0
+                tot = row.get("Total IDs") or 0
+                st.markdown(f"**{dom}**  \nMissing **{miss}** of **{tot}**")
+            st.caption("Tip: large gaps are good targets for follow-up on preferred path + DIRECT availability.")
+        else:
+            st.markdown('<span class="muted">No large missing-ID gaps detected.</span>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with cols[1]:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="card-title">Intermediary sellers spotted (examples)</div>', unsafe_allow_html=True)
+        top_inter = summary_obj["top_intermediaries"]
+        if top_inter:
+            for row in top_inter[:4]:
+                dom = row.get("Domain") or "—"
+                ex = (row.get("Examples") or "").strip()
+                ex = (ex[:140] + "…") if len(ex) > 140 else ex
+                st.markdown(f"**{dom}**  \n{ex if ex else 'Examples available in buyer pack ZIP.'}")
+        else:
+            st.markdown('<span class="muted">No intermediary examples captured in this run.</span>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with cols[2]:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="card-title">Unreachable verification targets</div>', unsafe_allow_html=True)
+        top_un = summary_obj["top_unreachable"]
+        if top_un:
+            for row in top_un[:5]:
+                dom = row.get("Domain") or "—"
+                status = row.get("Status")
+                reason = row.get("Reason") or "Blocked / unreachable"
+                reason = (reason[:120] + "…") if len(reason) > 120 else reason
+                st.markdown(f"**{dom}**  \n{('HTTP ' + str(status)) if status else 'No status'} · {reason}")
+        else:
+            st.markdown('<span class="muted">No unreachable targets recorded.</span>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Advanced details (still available, but NOT a wall of JSON)
     with st.expander("Detailed seller-verification findings (advanced)"):
         sf = sellers_report.get("findings", []) or []
-        # show a trimmed list
         max_show = 30
-        for i, f in enumerate(sf[:max_show], start=1):
-            st.markdown(f"**{i}. [{f.get('severity','')}] {f.get('title','')}**")
-            if f.get("why_buyer_cares"):
-                st.markdown(f"- *Why buyer cares:* {f.get('why_buyer_cares')}")
-            if f.get("recommendation"):
-                st.markdown(f"- *What to do:* {f.get('recommendation')}")
-            ev = f.get("evidence", {}) or {}
-            line = ev.get("line", "")
-            if line:
-                st.code(line, language="text")
-            st.write("")
-        if len(sf) > max_show:
-            st.info(f"Showing top {max_show} items. Download the buyer pack ZIP for the full JSON.")
 
+        def _format_evidence(rule_id: str, ev: Dict[str, Any]) -> str:
+            dom = ev.get("domain") or "—"
+            if rule_id == "SELLER_ID_NOT_FOUND_IN_SELLERS_JSON":
+                miss = ev.get("missing_count")
+                tot = ev.get("total_in_ads_txt")
+                ex = ev.get("examples") or ""
+                return f"{dom}: missing {miss}/{tot} seller IDs. Examples: {ex}"
+            if rule_id == "SELLERS_JSON_INTERMEDIARY_SELLERS_PRESENT":
+                ex = ev.get("examples") or ""
+                return f"{dom}: intermediary examples → {ex}"
+            if rule_id == "SELLERS_JSON_UNREACHABLE":
+                stt = ev.get("status")
+                err = ev.get("error") or ""
+                url = ev.get("used_url") or ""
+                bits = []
+                if url:
+                    bits.append(url)
+                if stt:
+                    bits.append(f"HTTP {stt}")
+                if err:
+                    bits.append(err)
+                return f"{dom}: " + " | ".join(bits) if bits else f"{dom}: unreachable"
+            # fallback
+            return json.dumps(ev, ensure_ascii=False)[:300]
+
+        for i, f in enumerate(sf[:max_show], start=1):
+            rid = str(f.get("rule_id", "")).strip()
+            sev = str(f.get("severity", "")).upper().strip()
+            title = f.get("title", "") or "Finding"
+            why = f.get("why_buyer_cares", "") or ""
+            rec = f.get("recommendation", "") or ""
+            ev = f.get("evidence", {}) or {}
+
+            st.markdown(f"**{i}. [{sev}] {title}**")
+            if why:
+                st.markdown(f"- *Why buyer cares:* {why}")
+            if rec:
+                st.markdown(f"- *What to do:* {rec}")
+            st.code(_format_evidence(rid, ev), language="text")
+            st.write("")
+
+        if len(sf) > max_show:
+            st.info(f"Showing top {max_show} items. Download the buyer pack ZIP for full evidence.")
