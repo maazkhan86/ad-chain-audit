@@ -1,0 +1,21 @@
+{
+  "ver": "1.0",
+  "complete": 1,
+  "nodes": [
+    {
+      "asi": "publisher-example.com",
+      "sid": "pub-12345",
+      "hp": 1
+    },
+    {
+      "asi": "ssp-example.com",
+      "sid": "seller-67890",
+      "hp": 1
+    },
+    {
+      "asi": "reseller-example.com",
+      "sid": "reseller-24680",
+      "hp": 0
+    }
+  ]
+}
