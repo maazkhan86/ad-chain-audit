@@ -14,7 +14,7 @@ from evidence_locker import save_phase2_evidence
 DEFAULT_TIMEOUT_S = 6
 DEFAULT_MAX_DOMAINS = 25
 
-USER_AGENT = "AdChainAudit/Phase2 (+https://github.com/maazkhan86/AdChainAudit)"
+USER_AGENT = "AdChainAudit/Phase2 (+https://github.com/maazkhan86/ad-chain-audit)"
 
 
 def _now_iso() -> str:
