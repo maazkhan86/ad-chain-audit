@@ -1,0 +1,26 @@
+{
+  "source": {
+    "fd": 1,
+    "tid": "FEDCBA9876543210",
+    "ext": {
+      "schain": {
+        "complete": 0,
+        "ver": "1.0",
+        "nodes": [
+          {
+            "asi": "reseller.com",
+            "sid": "aaaaa",
+            "rid": "BidRequest4",
+            "hp": 1
+          },
+          {
+            "asi": "exchange.example",
+            "sid": "12345",
+            "rid": "BidRequest4",
+            "hp": 0
+          }
+        ]
+      }
+    }
+  }
+}
