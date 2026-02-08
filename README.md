@@ -37,10 +37,10 @@ Programmatic supply chains are complex, costly, and still hard to verify end-to-
 
 ---
 
-## ✅ What AdChainAudit does (today)
+## What it does today
 
-### Phase 1: ads.txt audit (live)
-Upload (or paste) an `ads.txt` file and get:
+### Phase 1: ads.txt audit ✅
+You can fetch, upload, or paste an ads.txt input and get:
 
 - 📊 A simple **risk score**
 - 🧾 A **buyer-friendly summary** of potential red flags
@@ -81,29 +81,28 @@ ads.txt changes over time. Treat this as demo input only.
 
 ## 🧠 Roadmap (where this is going)
 
-### Phase 1 — Ads.txt hardening
+### Phase 1 — Ads.txt hardening ✅
 ✅ Ads.txt parsing + validation
-✅ Risk scoring + buyer-friendly red-flag report (with line-level evidence)
-✅ Domain mode: example.com → auto-fetch https://example.com/ads.txt (falls back to HTTP if needed; guides to upload/paste if blocked)
-✅ Demo mode: load a bundled sample ads.txt for instant testing
+✅ Risk scoring + red-flag report
+✅ Domain mode: example.com → fetch https://example.com/ads.txt
 ⬜ Change detection: diff + alerts (new sellers, new resellers, new risk)
 
-### Phase 2 — Seller verification (sellers.json)
-✅ Fetch/validate sellers.json per ad system (when accessible; HTTPS→HTTP fallback, handles blocked/non-JSON)
-✅ Verify seller IDs (ads.txt ↔ sellers.json) + surface intermediary seller signals (when available)
-✅ Buyer-friendly summary view (reachability + match rate + worst-match table + actionable “what to do next”)
-✅ Evidence locker + buyer pack ZIP (store fetched artifacts + timestamps + outputs for reproducibility)
-⬜ Portfolio mode: scan multiple publishers in one run + export consolidated report
+### Phase 2 — Seller verification (sellers.json) ✅
+✅ Fetch/validate sellers.json per ad system (when accessible)
+✅ Verify seller IDs + seller type signals (where available)
+✅ Evidence locker (store artifacts + timestamps + buyer pack ZIP)
 
-### Phase 3 — Full supply-chain graph
-⬜ Parse and map `schain` into a hop graph  
-⬜ SPO scoring: hops, reseller concentration, unknown hops, path cleanliness  
+### Phase 3 — Full supply-chain graph (schain) 🟡 in progress
+✅ Parse/decode schain into hop objects (OpenRTB SupplyChain)
+⬜ Visual hop graph in-app (clean, app-like view)
+⬜ SPO scoring: hops, reseller concentration, unknown hops, path cleanliness
 ⬜ Buyer controls: allowlists / blocklists / preferred paths
 
-### Phase 4 — Operator mode
-⬜ CLI: `adchainaudit scan <domain|file>`  
-⬜ GitHub Actions / CI checks for publisher ops workflows  
-⬜ Dashboards + scheduled scans + PDF buyer packs
+### Phase 4 — Operator mode ⬜
+⬜ CLI: adchainaudit scan <domain|file>
+⬜ Portfolio scanning (multiple domains)
+⬜ Scheduled scans + dashboards + PDF buyer packs
+⬜ GitHub Actions / CI checks for publisher ops workflows
 
 ---
 
